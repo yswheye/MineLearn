@@ -6,7 +6,7 @@ package com.example.garry.designpatterns.decorator;
  * 一般也是一个抽象类，实现抽象构件。
  * 在它的属性里面必然有一个private变量指向Component抽象构件。
  */
-public class Decorator implements Component {
+public abstract class Decorator implements Component {
     private Component component;
 
     public Decorator(Component component) {
@@ -16,5 +16,8 @@ public class Decorator implements Component {
     @Override
     public void operate() {
         this.component.operate();
+        decorator();
     }
+
+    public abstract void decorator();
 }

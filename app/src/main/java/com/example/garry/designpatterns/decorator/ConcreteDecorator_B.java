@@ -17,7 +17,12 @@ public class ConcreteDecorator_B extends Decorator {
     @Override
     public void operate() {
         super.operate();
-        this.method_B();
+//        this.method_B();
+    }
+
+    @Override
+    public void decorator() {
+        PrintUtils.println("do method_B");
     }
 
     private void method_B() {
