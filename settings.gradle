@@ -1,1 +1,1 @@
-include ':DesignPatterns'
+include ':DesignPatterns', ':Algorithm', ':AndroidDetails'
