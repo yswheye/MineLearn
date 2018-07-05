@@ -393,6 +393,114 @@ AsyncTask和Runnable都使用了匿名内部类，那么它们将持有其所在
 ### OkHttp，Rxjava源码分析
 ### Android插件化和热修复
 ### ListView和RecyclerView的原理和优化，区别
+#### ListView的缓存机制
+AbsListView, AdapterView  
+
+AbsListView是继承自AdapterView，在该类中实现了一个非常重要的内部类RecycleBin，内部类RecycleBin其实就是AbsListView缓存机制的核心类，它的作用是管理AbsListView的item存储和取得。AbsListview的缓存分为两级，第一级为activeView，第二级为scrapview。二者的间的转换主要是在layoutChildren()方法进行(该抽象方法在LisView中实现)
+
+缓存管理的核心在AbsListView的RecycleBin类  
+final RecycleBin mRecycler = new RecycleBin();  
+> 这个类是用来帮助在滑动布局时重用View的，RecycleBin包含了两个级别的存储，ActiveViews和ScrapViews，ActiveViews存储的是第一次显示在屏幕上的View；所有的ActiveViews最终都会被移到ScrapViews，ScrapViews存储的是有可能被adapter复用的View。
+现在很明确了AbsListView缓存依赖于两个数组，一个数组存储屏幕上当前现实的ItemView，一个显示从屏幕下移除的且可能会被复用的ItemView。
+
+> 如果数据发生变化则把当前的ItemView放入ScrapViews中，否则把当前显示的ItemView放入ActiveViews中。
+
+同时AbsListview中定义了一个ObtainView方法，一般地当Listview加载时若发现没有可复用的itemView时要么从RecycleBin中转换ScrapView,要么是通过mAdapter.getView()获取新的itemView,ObtainView方法就是专门用来处理上述的两种情况.
+
+#### ListView的优化
+* convertView的复用
+
+	listivew每次滚动都会调用gitview()方法，所以优化gitview是重中之重。这部分代码很简单，如果没有缓存就加载布局，如果有缓存就直接用convertView对象。所以这样就不用滑动listview的时候调用getView()方法每次都去加载布局了（如果该布局已经加载）。
+	
+		View view;
+		if(convertView == null){
+			view = LayoutInfalter.from(getContext()).inflate(resourceID，null)
+		} else {
+			
+		}
+		
+* ViewHolder的使用
+
+	主要优化getView方法中每次回调用findviewByID()方法来获取一次控件的代码。新增加内部类ViewHolder,用于对控件的实例存储进行缓存。  
+	convertView为空时，viewHolder会将空间的实力存放在ViewHolder里，然后用setTag方法讲viewHolder对象存储在view里。  
+	convertView不为空时，用getTag方法获取viewHolder对象.
+	
+		//getView核心代码
+		ViewHolder viewHolder;
+		if(convertView == null){
+			viewHolder = new ViewHolder();
+			viewHolder.fruitImage = (ImageView) view.findViewByID(R.id.fruit_image);
+			view.setTage(viewHolder);//讲ViewHolder存储在View中
+		}else{
+			viewHolder = ViewHolder view.getTag();//重获取viewHolder
+		}
+		viewHolder.fruitImage.setImageResource(fruit.getIMageID);
+		
+* 分页加载
+* 滑动时不加载图片
+
+		listView.setOnScrollListener(new OnScrollListener() {
+
+            @Override
+            public void onScrollStateChanged(AbsListView listView, int scrollState) {
+                    //停止加载图片 
+                    if (scrollState == AbsListView.OnScrollListener.SCROLL_STATE_FLING) {
+                            imageLoader.stopProcessingQueue();
+                    } else {
+                    //开始加载图片
+                            imageLoader.startProcessingQueue();
+                    }
+            }
+
+            @Override
+            public void onScroll(AbsListView view, int firstVisibleItem, int visibleItemCount, int totalItemCount) {
+                    // TODO Auto-generated method stub
+
+            }
+    	});
+* 将ListView的scrollingCache和animateCache设置为false
+
+	scrollingCache:   
+	scrollingCache本质上是drawing cache，你可以让一个View将他自己的drawing保存在cache中（保存为一个bitmap），这样下次再显示View的时候就不用重画了，而是从cache中取出。默认情况下drawing cahce是禁用的，因为它太耗内存了，但是它确实比重画来的更加平滑。而在ListView中，scrollingCache是默认开启的，我们可以手动将它关闭。
+
+	animateCache:   
+	ListView默认开启了animateCache，这会消耗大量的内存，因此会频繁调用GC，我们可以手动将它关闭掉
+* 减少item的布局的深度
+
+#### item分割线
+ListView中设置 divider 非常简单，只需要在 XML 文件中设置就可以了，同时还可以设置divider 高度。
+
+	android:divider="@android:color/black"
+	android:dividerHeight="2dp"
+
+而在RecyclerView里面，想实现这两种需求，稍微复杂一点，需要自己继承RecyclerView.ItemDecoration来实现想要实现的方法。
+虽说这样写灵活多了，但是要额外写一个类去做难免麻烦，这里大家可以看我已经实现好的一个封装，包括显示纯色divider、显示图片divider、divider的上下左右的间距、宽高设置 应该可以满足基本需求了：[Divider.java](https://github.com/kymjs/CoreModule/blob/master/CoreModule/recycler/src/main/java/com/kymjs/recycler/Divider.java)，[使用方法。](https://github.com/kymjs/RecyclerViewDemo/blob/master/RecyclerViewDemo/sample/src/main/java/com/kymjs/sample/Demo4Activity.java)
+
+##### ItemDecoration 工作原理
+ItemDecoration 是为了显示每个 item 之间分隔样式的。它的本质实际上就是一个 Drawable。当 RecyclerView 执行到onDraw() 方法的时候，就会调用到他的 onDraw()，这时，如果你重写了这个方法，就相当于是直接在 RecyclerView 上画了一个 Drawable 表现的东西。 而最后，在他的内部还有一个叫getItemOffsets()的方法，从字面就可以理解，他是用来偏移每个 item 视图的。当我们在每个 item 视图之间强行插入绘画了一段 Drawable，那么如果再照着原本的逻辑去绘 item 视图，就会覆盖掉 Decoration 了，所以需要getItemOffsets()这个方法，让每个 item 往后面偏移一点，不要覆盖到之前画上的分隔样式了。
+
+##### LayoutManager工作原理
+	java.lang.Object  
+	   ↳ android.view.View  
+	        ↳ android.view.ViewGroup  
+	            ↳ android.support.v7.widget.RecyclerView
+首先是 RecyclerView 继承关系，可以看到，与 ListView 不同，他是一个 ViewGroup。既然是一个 View，那么就不可少的要经历onMeasure()、onLayout()、onDraw() 这三个方法。 实际上，RecyclerView 就是将onMeasure()、onLayout() 交给了 LayoutManager 去处理，因此如果给 RecyclerView 设置不同的 LayoutManager 就可以达到不同的显示效果，因为onMeasure()、onLayout()都不同了嘛。
+
+##### ItemAnimator
+每一个 item 在特定情况下都会执行的动画。说是特定情况，其实就是在视图发生改变，我们手动调用notifyxxxx()的时候。通常这个时候我们会要传一个下标，那么从这个标记开始一直到结束，所有 item 视图都会被执行一次这个动画。
+
+##### Adapter工作原理
+首先是适配器，适配器的作用都是类似的，用于提供每个 item 视图，并返回给 RecyclerView 作为其子布局添加到内部。
+但是，与 ListView 不同的是，ListView 的适配器是直接返回一个 View，将这个 View 加入到 ListView 内部。而 RecyclerView 是返回一个 ViewHolder 并且不是直接将这个 holder 加入到视图内部，而是加入到一个缓存区域，在视图需要的时候去缓存区域找到 holder 再间接的找到 holder 包裹的 View。
+
+##### ViewHolder
+每个 ViewHolder 的内部是一个 View，并且 ViewHolder 必须继承自RecyclerView.ViewHolder类。这主要是因为 RecyclerView 内部的缓存结构并不是像 ListView 那样去缓存一个 View，而是直接缓存一个 ViewHolder ，在 ViewHolder 的内部又持有了一个 View。既然是缓存一个 ViewHolder，那么当然就必须所有的 ViewHolder 都继承同一个类才能做到了。
+
+##### RecyclerView的缓存和复用
+RecyclerView 的内部维护了一个二级缓存，滑出界面的 ViewHolder 会暂时放到 cache 结构中，而从 cache 结构中移除的 ViewHolder，则会放到一个叫做RecycledViewPool 的循环缓存池中。
+顺带一说，RecycledView 的性能并不比 ListView 要好多少，它最大的优势在于其扩展性。但是有一点，在 RecycledView 内部的这个第二级缓存池RecycledViewPool是可以被多个 RecyclerView 共用的，这一点比起直接缓存 View 的 ListView 就要高明了很多，但也正是因为需要被多个 RecyclerView 公用，所以我们的 ViewHolder 必须继承自同一个基类(即RecyclerView.ViewHolder)。
+默认的情况下，cache 缓存 2 个 holder，RecycledViewPool 缓存 5 个 holder。对于二级缓存池中的 holder 对象，会根据 viewType 进行分类，不同类型的 viewType 之间互不影响。
+
 ### AsyncTask源码解析
 AsyncTask 是一个较为轻量级的异步任务类，在底层通过封装 ThreadPool 和 Handler，实现了线程的复用，后台任务执行顺序的控制、子线程和 UI 线程的切换，使得开发者可以以简单的方法来执行一些耗时任务
 
@@ -630,8 +738,6 @@ MessageQueue存储消息的容器。
 
 ActivityThread通过ApplicationThread和AMS进行进程间通讯，AMS以进程间通信的方式完成ActivityThread的请求后会回调ApplicationThread中的Binder方法，然后ApplicationThread会向H发送消息，H收到消息后会将ApplicationThread中的逻辑切换到ActivityThread中去执行，即切换到主线程中去执行，这个过程就是。主线程的消息循环模型.
 
-
-
 #### 子线程怎么使用Looper? 
 新线程是没有开启消息循环的，所以需要用到Looper的方法创建消息循环（主线程除外，主线程会自动为其创建Looper对象，开启消息循环）  
 Looper.prepare()//为当前线程创建一个Looper    
@@ -677,6 +783,12 @@ Handler创建的时候会采用当前线程的Looper来构造消息循环系统�
 当然需要注意的是  
 	①线程是默认没有Looper的，如果需要使用Handler，就必须为线程创建Looper。我们经常提到的主线程，也叫UI线程，它就是ActivityThread    
 	②ActivityThread被创建时就会初始化Looper，这也是在主线程中默认可以使用Handler的原因。
+	
+#### 子线程有哪些更新UI的方法？
+* 主线程中定义Handler，子线程通过mHandler发送消息，主线程Handler的handleMessage更新UI。
+* 用Activity对象的runOnUiThread方法。
+* 创建Handler，传入getMainLooper。
+* View.post(Runnable r) 。
 	
 ### App启动流程
 ActivityThread
@@ -875,6 +987,31 @@ ContentResolver是操作者，通过特定URI来对数据进行增删改查
 ## Java 
 ### Java类加载
 ### 强引用、弱引用、软引用
+* 强引用（StrongReference）
+	
+	强引用是最普遍的引用。如果一个对象具有强引用，垃圾回收器（GC）绝不会回收它。当内存不足时，Java虚拟机会抛出OutOfMemoryError错误，不会回收强引用的对象来解决内存不足。所以，强引用的对象，在应用的生命后期如果不再使用，一定要释放它，以便让系统回收。
+	
+	如果想中断强引用和某个对象之间的关联，可以显示地将引用赋值为null，这样一来的话，JVM在合适的时间就会回收该对象。
+	
+* 软引用（SoftReference）
+
+	如果一个对象只具有软引用，则内存空间足够，垃圾回收器就不会回收它；如果内存空间不足了，就会回收这些对象的内存。只要垃圾回收器没有回收它，该对象就可以被程序使用。**软引用可用来实现内存敏感的高速缓存。比如网页缓存、图片缓存等。** 软引用可以和一个引用队列（ReferenceQueue）联合使用，如果软引用所引用的对象被垃圾回收器回收，Java虚拟机就会把这个软引用加入到与之关联的引用队列中。
+
+* 弱引用（WeakReference）
+
+	弱引用与软引用的区别在于：只具有弱引用的对象拥有更短暂的生命周期。在垃圾回收器线程扫描它所管辖的内存区域的过程中，一旦发现了只具有弱引用的对象，不管当前内存空间足够与否，都会回收它的内存。不过，由于垃圾回收器是一个优先级很低的线程，因此不一定会很快发现那些只具有弱引用的对象。
+弱引用可以和一个引用队列（ReferenceQueue）联合使用，如果弱引用所引用的对象被垃圾回收，Java虚拟机就会把这个弱引用加入到与之关联的引用队列中。
+
+* 虚引用（PhantomReference）
+
+	“虚引用”顾名思义，就是形同虚设，与其他几种引用都不同，虚引用并不会决定对象的生命周期。如果一个对象仅持有虚引用，那么它就和没有任何引用一样，在任何时候都可能被垃圾回收器回收。
+虚引用主要用来跟踪对象被垃圾回收器回收的活动。虚引用与软引用和弱引用的一个区别在于：虚引用必须和引用队列 （ReferenceQueue）联合使用。当垃圾回收器准备回收一个对象时，如果发现它还有虚引用，就会在回收对象的内存之前，把这个虚引用加入到与之 关联的引用队列中。
+
+		ReferenceQueue queue = new ReferenceQueue ();
+		PhantomReference pr = new PhantomReference (object, queue); 
+
+	程序可以通过判断引用队列中是否已经加入了虚引用，来了解被引用的对象是否将要被垃圾回收。如果程序发现某个虚引用已经被加入到引用队列，那么就可以在所引用的对象的内存被回收之前采取必要的行动。
+
 ### Leecode算法题
 ### 集合基础知识
 ### Java内存模型
