@@ -1126,11 +1126,203 @@ system_server拥有ATP/AMS, 每一个新创建的进程都会有一个相应的A
 7. ApplicationThread把这个启动Activity的操作转发给ActivityThread，ActivityThread通过ClassLoader导入相应的Activity类，然后把它启动起来。
 
 
-### APK安装与解析过程
+### APK安装和启动
+---
+[概述安卓App的安装和启动](https://www.jianshu.com/p/fa31d64ca57b)
+
+#### 安装
+我们知道，Android的安装包Apk其实就是个资源和组件的容器压缩包，安装的过程主要是复制和解析的过程，这个过程大概分这样几步：
+
+##### 1. 复制
+安卓的程序目录是/data/app/，所以安装的第一步就是把apk文件复制到这个目录下。这里有四个问题：
+
+* 安卓机有内部存储和SD卡两部分，很多安卓机的内存并不大，需要把apk安装到SD卡上节省内存空间，所以程序目录/data/app/实际上也是在内部存储和SD卡上各一个。
+* 系统自带的App是安装在/system/app/目录下的，这个目录只有root权限才能访问，所以系统App在root之前是无法删除和修改的，也就是说，系统App升级时，实际上是在/data/app/里重新安装了一个App，这个路径会重新注册到系统那里，系统再打开App时，就会指向新App的地址。当然，这个新的App是可以卸载的，不过新的App卸载后，系统会把 /system/app/里那个旧的App提供给你，所以是卸掉新的，还你旧的。
+* 还是系统App，在root后，我们可以操作/system/app/目录，但是系统安装Apk仍然会装到/data/app/里，所以如果想修改/system/app/目录里的app，必须自己手动push新的apk文件进去，这个新的apk文件不会自动被安装，需要重启设备，系统在重启时检查到apk被更新，才会去安装apk。
+* 系统目录有个/system/priv-app/目录，这里面放的是权限更高的系统核心应用，如开机launcher、系统UI、系统设置等，这个目录我们最好不要动，保持系统干净简洁。
+
+##### 2. 安装
+安卓系统开机启动时，会启动一个超级管理服务SystemServer，这个SystemServer会启动所有的系统核心服务，其中就包括PackageManagerService，简称PMS，具体的apk安装过程，就是由这个PMS操作的。
+PMS会监控/data/app/这个目录，在上一步中，系统安装程序向这个目录复制了一个apk，PMS自己就会定期扫描这个目录，找到后缀为apk的文件，如果这个apk没有被安装过，它就会自动开始安装，安装时会做这么几件事：
+
+* 创建应用目录，路径为/data/data/your package(你的应用包名)，App中使用的数据库、so库、xml文件等，都会放在这个目录下。
+* 提取dex文件，dex是App的可执行文件，系统解压apk就能得到dex文件，然后把dex文件放到/data/dalvik-cache，这样可以提前缓存dex到内存中，能加快启动速度。系统还会把dex优化为odex，进一步加快启动速度。
+* 判断是否可以安装apk，如检查apk签名等。
+* 为应用分配并保存一个UID，UID是来自Linux的用户账户体系，不过在Android这种单用户系统里，UID被用来与App对应，这也是安全机制的一部分，每个App都有自己对应的UID，这种对应关系是持久化保存的，App更新或卸载重装后，系统还会给它分配原来那个UID。用adb pull /data/system/packages.list可以查看所有App的UID。GID（用户组）一般等于UID。
+* 利用AndroidManifest文件，注册Apk的各项信息，包括但不限于：
+	
+	* 根据installLocation属性（internalOnly、auto、preferExternal），选择安装在内部存储器还是SD卡上。
+	* 根据sharedUserId属性，为App分配UID，如果两个App使用同一个UID，打包时又使用了相同的签名，它们就被视为同一个用户，可以共享数据，甚至运行在同一个进程上。
+	* 向/data/system/packages.xml文件中，记录App的包名、权限、版本号、安装路径等；同时在/data/system/packages.list中，更新所有已安装的app列表。
+	* 注册App中的的四大组件（Activity、Service、Broadcast Receiver和Content Provider），包括组件的intent-filter和permission等。
+	* 在桌面上添加App的快捷方式，如果AndroidManifest文件中有多个Activity被标注为<action android:name="android.intent.action.MAIN" />和
+<category android:name="android.intent.category.LAUNCHER" />，系统就会向桌面添加多个App快捷方式，所以有时候在安装一个App后，用户可能会感觉安装了多个App。
+
+##### 3. 通知
+apk安装完成后，PMS会发一个ACTION_PACKAGE_ADDED广播，如果是卸载，会发ACTION_PACKAGE_REMOVED广播。
+整个安装过程大概是这样的：
+
+![](https://upload-images.jianshu.io/upload_images/1863579-349f7d80e12f08f5.png?imageMogr2/auto-orient/strip%7CimageView2/2/w/405)
+
+#### 启动
+启动一个App，首先需要触发启动过程，然后分配系统资源，最后才启动要打开的App组件。
+
+##### 1. 触发启动过程
+在安卓系统开机启动时，启动的超级管理服务SystemServer会启动所有的系统核心服务，其中就包括ActivityManagerService，简称AMS，启动App具体都是AMS来负责的。
+不过，一般Java程序都有个main函数入口，启动Java程序其实就是执行main函数去了。但是，安卓App不是这样设计的，App并没有统一的程序入口，一个App其实更像是一群组件的集合，启动App其实就是启动了某个组件，即便是从桌面点击应用图标打开某个App，也是系统桌面Home根据安装时注册的组件信息，找到这个图标对应的Activity信息，再由AMS去启动Activity组件。
+
+##### 2. 分配系统资源
+在安卓系统里，除非人为设置为多进程（Activity的android:process属性），否则默认每个App都有1个独立的进程和虚拟机，所以在系统启动时，系统会建立一个Linux进程(Process)，在这个进程里放一个虚拟机VM，在这个VM里，运行你的App。
+在系统层面，它其实要做这么几件事：
+
+1. 分配UID，App要有UID才能有自己的系统资源，UID是在安装App时由系统分配的，一般每个App都有自己的UID，App的资源不能共享，因为它们不属于同一个用户。
+2. 分配进程Process，系统会给App一个进程，每个App的都有自己的进程，进程的PID是系统即时生成的，用完销毁。
+如果要让两个App共用进程，除了需要设置同一个进程（android:process），还需要分配同一个UID（android:sharedUserId）来共享系统资源，使用同一个应用签名（同一个签名证书才可以视为同一个程序）。
+有时候，如果某些业务特别消耗内存或特别耗时，还可以把1个App分成多个进程，让某些组件在独立的进程中工作，销毁该组建时，把整个进程一起用system.exit来销毁掉。
+3. 提供虚拟机VM，安卓App是java程序，需要在java虚拟机上运行，这个虚拟机需要由系统在分配进程时，和进程一起提供。
+4. 除非做了跨进程跨用户的配置，否则App之间是隔离的，不能直接互相访问，也不能直接共享资源。
+5. AMS管理启动过程，启动App的工作都是AMS统一负责的，AMS里保存了App对应的系统进程ID（PID），在启动App时，AMS会去找App对应的PID，如果找不到PID，说明需要创建进程，就会要求系统为App提供进程和VM。
+6. 提供进程和VM，创建VM是非常耗时的，为了加快App启动速度，安卓系统采用了复制的方式：系统开机启动时会启动一个Zygote进程，这个进程会初始化系统的第一个VM, 并预加载framework等app通用资源，当安卓要启动某个App时，Zygote通过fork复制Zygote的VM，就可以快速创建一个带VM的进程，为App运行提供载体。系统开机启动时的第一个进程一般是桌面Home进程。
+
+![提供系统资源](https://upload-images.jianshu.io/upload_images/1863579-ceca3eb82dec3aac.png?imageMogr2/auto-orient/strip%7CimageView2/2/w/581)
+
+##### 3. 启动要打开的App组件
+App本身没有main函数入口，但是系统在启动进程时，会创建一个主线程ActivityThread对象（Process.start("android.app.ActivityThread",...)），这个ActivityThread是一个final类，虽然不是线程，但是管理者主线程，它是有main函数入口的（Java终于找到组织了），ActivityThread有这么几个作用：
+
+1. 管理App的主线程，也就是UI线程，启动主线程的Looper，只有主线程可以调用View的onDraw函数来刷新界面(为了线程安全)。
+至于视频类控件，都不是View而是SurfaceView，所以可以用子线程刷新，而且SurfaceView是直接绘制到屏幕上的，和View是分开管理的。  
+另外，BroadCast消息也是主线程处理的，主线程创建BroadCastReceiver对象，并调用其onReceive()函数，处理完就销毁，所以它的生命周期很短（10秒，超时就ANR）。
+2. 负责管理调度进程资源、Application和App四大组件中的三个（Activity，Service，ContentProvider），列表中的组件用Token区分，至于BroadCastReceiver，因为是随用随造，用完销毁，所以不需要保存和管理。
+3. 构建Context和Application，这个任务包括检查和加载LoadedApk对象、设置分辨率密度、是否高耗内存、获取package和component等启动信息、获取ClassLoader把类加载到内存等，最后，先创建一个context对象contextimpl.createAppContext(this,getSystemContext().mPackageInfo;)，再用context去创建Application对象context.mPackageInfo.makeApplication(true,null)。
+4. 对接AMS，AMS自己有专门的系统进程，ActivityThread把一个ApplicationThread（一个Bindler对象）作为自己的Proxy交给AMS，以便由AMS来调度管理ActivityThread中的Activity。
+5. 处理消息，ActivityThread是通过消息机制来启动App组件的，ActivityThread有Message队列、Handler和Looper，在AMS启动Activity时，AMS会向ActivityThread发送LAUNCH_ACTIVITY消息启动Activity，ActivityThread收到这个消息后启动Activity，然后，就进入我们熟悉的组件onCreate生命周期了。
+6. 重要系统服务如SystemServer也是App，也有ActivityThread，也可能出现ANR之类的异常，为了避免系统“跑飞”，这些应用都有Watchdog看护，出现问题会重启设备。
+
+启动过程大概是这样的：  
+![](https://upload-images.jianshu.io/upload_images/1863579-811f6b7a80f77135.png?imageMogr2/auto-orient/strip%7CimageView2/2/w/589)
+
+AMS是通过IPC向ActivityThread传递消息的。
+
+另外，在创建组件时，组件之间有这样几个区别：
+
+1. Application和四大组件的启动时机：
+Application是主线程启动时创建的，这是应用程序运行的第一个类、
+ContentProvider是主线程启动时创建的（并发布到AMS）、
+BroadCastReceiver是主线程收到广播时创建的（前台10秒/后台60秒ANR）、
+Activity是AMS发消息让主线程创建的（5秒ANR）、
+Service是AMS通过ApplicationThread接口，让主线程创建的（并运行在主线程上，前台20秒/后台200秒ANR）。
+2. 关于Context：
+App里依靠context来提供资源和上下文，所以Application、Activity和Service有context（它们都extends Context）、
+BroadCastReceiver没有context，主线程在调用onReceive时会把Application的context作为参数传进去、
+ContentProvider也没有context、
+虽然组件有各自的context，但它们指向同一块资源，因为实现ContextImpl时，获取资源的ResourcesManager采用单例模式，所以同一个App的不同context都指向同一个Resource对象
+Activity的context多了主题Theme，而Application的context生命周期最长。    
+
+	这些context之间的关系如下：  
+![context关系图](https://upload-images.jianshu.io/upload_images/1863579-c43d8440de63f120.png?imageMogr2/auto-orient/strip%7CimageView2/2/w/700)
+
+3. 关于对Application的共享：
+App中的Application是一个单例，整个App是共享同一个Application对象的、
+Activity和Service都有getApplication函数、这个Application是在创建组件时赋给组件的，比如Activity就是ActivityThread在performLaunchActivity时，把Application实体赋给Application的。
+组件有getApplication和getApplicationContext两个函数，这两个函数一个是组件本身的，一个contextwrapper要求实现的，很多情况下他们返回的是一个对象，但是官方并不建议把两者混淆。
+
+
 ### Dex加载
 
 	
-### MVP MVC
+### MVC&MVP
+---
+#### MVC模式
+模型(model)－视图(view)－控制器(controller)
+
+![](https://upload-images.jianshu.io/upload_images/5615762-d6339b3f09f89a2c?imageMogr2/auto-orient/strip%7CimageView2/2/w/700)
+
+* Model层：适合做一些业务逻辑处理，比如数据库存取操作，网络操作，复杂的算法，耗时的任务等都在model层处理。
+* View层：应用层中处理数据显示的部分，XML布局可以视为V层，显示Model层的数据结果。
+* Controller层：在Android中，Activity处理用户交互问题，因此可以认为Activity是控制器，Activity读取V视图层的数据（eg.读取当前EditText控件的数据），控制用户输入（eg.EditText控件数据的输入），并向Model发送数据请求（eg.发起网络请求等）。
+
+
+#### MVC的优缺点
+优点：
+
+1. 耦合性低。所谓耦合性就是模块代码之间的关联程度。利用MVC框架使得View（视图）层和Model（模型）层可以很好的分离，这样就达到了解耦的目的，所以耦合性低，减少模块代码之间的相互影响。
+2. 可扩展性好。由于耦合性低，添加需求，扩展代码就可以减少修改之前的代码，降低bug的出现率。
+3. 模块职责划分明确。主要划分层M,V,C三个模块，利于代码的维护。
+4. 部署快
+5. 可维护性高
+6. 有利于软件工程化管理
+
+缺点：
+
+1. View和Controller的连接过于紧密
+2. 很容易把Activity即当View又当Controller使用
+3. 没有明确的定义
+4. 不适合小型中等规模的应用
+
+#### MVP模式
+在MVP模式里通常包含4个要素：
+
+1. View : 负责绘制UI元素、与用户进行交互(在Android中体现为Activity);
+2. View interface : 需要View实现的接口，View通过View interface与Presenter进行交互，降低耦合，方便进行单元测试;
+3. Model : 也叫数据层，负责存储、检索、操纵数据(有时也实现一个Model interface用来降低耦合);
+4. Presenter : 作为View与Model交互的中间纽带，处理与用户交互的负责逻辑。
+
+#### MVP的优缺点
+优点：
+
+1. 降低耦合度，实现了Model和View真正的完全分离，可以修改View而不影响Modle
+2. 模块职责划分明显，层次清晰（下面会介绍Bob大叔的Clean Architecture）
+3. 隐藏数据
+4. Presenter可以复用，一个Presenter可以用于多个View，而不需要更改Presenter的逻辑（当然是在View的改动不影响业务逻辑的前提下）
+5. 利于测试驱动开发。以前的Android开发是难以进行单元测试的（虽然很多Android开发者都没有写过测试用例，但是随着项目变得越来越复杂，没有测试是很难保证软件质量的；而且近几年来Android上的测试框架已经有了长足的发展——开始写测试用例吧），在使用MVP的项目中Presenter对View是通过接口进行，在对Presenter进行不依赖UI环境的单元测试的时候。可以通过Mock一个View对象，这个对象只需要实现了View的接口即可。然后依赖注入到Presenter中，单元测试的时候就可以完整的测试Presenter应用逻辑的正确性。
+6. View可以进行组件化。在MVP当中，View不依赖Model。这样就可以让View从特定的业务场景中脱离出来，可以说View可以做到对业务完全无知。它只需要提供一系列接口提供给上层操作。这样就可以做到高度可复用的View组件。
+7. 代码灵活性
+8. Activity和Fragment变得非常轻量。他们唯一的职责就是建立/更新UI和处理用户事件。因此，他们变得更容易维护。
+
+缺点：
+
+1. Presenter中除了应用逻辑以外，还有大量的View->Model，Model->View的手动同步逻辑，造成Presenter比较笨重，维护起来会比较困难。
+2. 由于对视图的渲染放在了Presenter中，所以视图和Presenter的交互会过于频繁。
+3. 如果Presenter过多地渲染了视图，往往会使得它与特定的视图的联系过于紧密。一旦视图需要变更，那么Presenter也需要变更了。
+4. 额外的代码复杂度及学习成本。
+
+#### MVP的优化
+1. Model和View的数据绑定
+	
+	标准的方式是通过定义view接口协议来回调数据。   
+	需要些大量的view接口类，并定义回调方法。
+
+	![](https://upload-images.jianshu.io/upload_images/1833901-5e7faae173791a47.png?imageMogr2/auto-orient/strip%7CimageView2/2/w/700)
+	
+	上图是通过EventBus注解的方式进行数据绑定，Presenter通过EventBus post数据。   
+简单，方便，不用定义很多view接口类。
+
+2. Presenter和View生命周期的绑定
+
+	原始的MVP并没有关注Presenter的生命周期  
+	
+	可以定义一个MVPDispatcher或Presenter的管理类，MVPDispatcher有个list MVPDispatcher并定义了各种生命周期方法，最后在BaseActivity中进行绑定。
+	
+	利用Loader，它是由系统提供的并和Activity/Fragment 的生命周期绑定。
+	
+3. 一个View绑定多个Presenter
+
+	最初的方案，使用泛型 BaseActivity<P extends BasePresenter>  
+	这样的结果是BaseActivity只能绑定一个Presenter  
+	也就是说一个页面的所有逻辑都要放到一个Presenter中去处理
+	
+	在BaseActivity中createPresenters添加到MVPDispatcher
+	
+	还有一种实现，通过注解绑定多个Presenter
+	
+4. 其他演进
+
+	使用 Activity/Fragment 作为 Presenter 的探索  
+	使用 Adapter作为 Presenter的探讨
+	
+#### MVC和MVP区别
+MVP与MVC最大的一个区别就是：Model与View层之间倒底该不该通信（甚至双向通信）
+
 ### 性能优化
 ---
 #### 1.布局优化  
@@ -1210,12 +1402,616 @@ TraceView绘制耗时分析
 * LeakCanary  
 分析内存泄漏
 
-### 自定义view
+### View的绘制流程
+---
+[详解View的绘制流程](https://blog.csdn.net/say_from_wen/article/details/79086405)
 
+#### 谁负责View的绘制？
+ViewRoot是android用来负责执行View绘制的整个流程的。实际上，View的绘制是由ViewRoot来负责，具体由ViewRootImpl类来实现。在android中，每个应用程序窗口的DecorView都有一个与之关联的ViewRoot对象（ViewRootImpl），这种关联关系是由WindowManager来维护的（windowManagerImpl实现）。在Activity启动时，ActivityThread.handleResumeActivity()方法中建立了它们两者的关联关系。
+
+#### View绘制的源头
+我们还要从Activity在第一次setContentView时说起，其实这步操作做的操作是初始化各个view对象， 并制定上下级关系，仅此而已。真正开始的地方是**ActivityThread.handleResumeActivity**中通过windowManager的实现类windowManagerImpl的addView方法，方法内部通过ViewRootImpl的实例调用setView方法。该方法内部的requestlayout方法中会执行scheduleTraversals()方法，在方法中会通过内部的Handler发出消息，开始执行doTraversal，从而执行performTraversals()，View的绘制流程正式开始。
+
+`接口类ViewManager、WindowManager，WindowManager 继承ViewManager。 ` 
+
+ActivityThread的handleResumeActivity()  
+WindowManager的实现类WindowManagerImpl addView()    
+ViewRootImpl setView()->requestLayout()->scheduleTraversals()通过handler发送消息  
+然后执行doTraversal()->performTraversals()
+
+
+    //ViewRootImpl类部分源码
+    public void setView(View view, WindowManager.LayoutParams attrs, View panelParentView) {
+                // Schedule the first layout -before- adding to the window
+                // manager, to make sure we do the relayout before receiving
+                // any other events from the system.
+                requestLayout();
+    }
+
+    @Override
+    public void requestLayout() {
+        if (!mHandlingLayoutInLayoutRequest) {
+            checkThread();//检查是否在主线程
+            mLayoutRequested = true;//mLayoutRequested 是否measure和layout布局。
+            scheduleTraversals();
+        }
+    }
+
+    void scheduleTraversals() {
+        if (!mTraversalScheduled) {
+            mTraversalScheduled = true;
+            mTraversalBarrier = mHandler.getLooper().getQueue().postSyncBarrier();
+
+            //post一个runnable处理-->mTraversalRunnable
+            mChoreographer.postCallback(
+                    Choreographer.CALLBACK_TRAVERSAL, mTraversalRunnable, null);
+            ``````//省略
+        }
+    }
+
+    final class TraversalRunnable implements Runnable {
+        @Override
+        public void run() {
+            doTraversal();
+        }
+    }
+    final TraversalRunnable mTraversalRunnable = new TraversalRunnable();
+    void doTraversal() {
+            mHandler.getLooper().getQueue().removeSyncBarrier(mTraversalBarrier);
+            performTraversals();//View的绘制流程正式开始。
+    }
+
+#### View绘制的主要流程
+View的绘制主要流程分为三步，measure、layout和draw。整个View树的绘图流程是在ViewRootImpl类的performTraversals()方法（这个方法巨长）开始的，该函数做的执行过程主要是根据之前设置的状态，判断是否重新计算视图大小(measure)、是否重新放置视图的位置(layout)、以及是否重绘 (draw)，其核心也就是通过判断来选择顺序执行这三个方法中的哪个。下面看源码（ViewRootImpl类中）：
+
+注：此段源码会说明一问题，为什么我们App看到的视图都是全屏。
+
+    private void performTraversals() {
+        ......
+        //最外层的根视图的widthMeasureSpec和heightMeasureSpec由来
+        //lp.width和lp.height在创建ViewGroup实例时等于MATCH_PARENT
+        int childWidthMeasureSpec = getRootMeasureSpec(mWidth, lp.width);
+        int childHeightMeasureSpec = getRootMeasureSpec(mHeight, lp.height);
+        ......
+        //mView就是我们的DecorVIew
+        mView.measure(childWidthMeasureSpec, childHeightMeasureSpec);
+        ......
+        mView.layout(0, 0, mView.getMeasuredWidth(), mView.getMeasuredHeight());
+        ......
+        mView.draw(canvas);
+        ......
+    }
+    
+    private static int getRootMeasureSpec(int windowSize, int rootDimension) {
+        int measureSpec;
+        switch (rootDimension) {
+    //上面传入参数后这个函数走的是MATCH_PARENT，使用MeasureSpec.makeMeasureSpec方法组装一个MeasureSpec，MeasureSpec的specMode等于EXACTLY，specSize等于windowSize，也就是为何根视图总是全屏的原因。
+        case ViewGroup.LayoutParams.MATCH_PARENT:
+            measureSpec = MeasureSpec.makeMeasureSpec(windowSize, MeasureSpec.EXACTLY);
+            break;
+        ......
+        }
+        return measureSpec;
+    }
+
+总而言之，performTraversals就是做了这些事情：
+
+![](https://ws1.sinaimg.cn/large/628a632agy1ftl19p6yzdj20jg058gnn.jpg)
+
+#### Measure
+要理解measure，首先要理解下MeasureSpec：
+
+MeasureSpec决定了一个View的尺寸规格，并且View的MeasureSpec受自身的LayoutParams(一般是xml布局中width和height)和父容器MeasureSpec的影响。MeasureSpec又由SpecMode 和SpecSize 组成。SpecMode 是测量模式，有UNSPECIFIED（父容器对子View的尺寸不作限制，由子View自己测量）、 EXACTLY（ SpecSize 表示View的最终大小，因为父容器已经检测出View所需要的精确大小，它对应LayoutParams中的match\_parent和具体的数值这两种模式）、AT\_MOST（SpecSize 表示父容器的可用大小，View的大小不能大于这个值。它对应LayoutParams中的wrap_content。）三种。SpecSize是在某种测量模式下的尺寸和大小。
+
+整个View树的源码measure流程图（引用自凶残的程序员）
+
+![这里写图片描述](https://ws1.sinaimg.cn/large/628a632agy1ftl1dayq0sj20hz0llq49.jpg)
+
+Measure阶段的目的是计算出控件树中的各个控件要显示其内容需要多大尺寸。起点是ViewRootImpl的measureHierarchy()方法，这个方法的源码如下：
+
+	private boolean measureHierarchy(final View host, final WindowManager.LayoutParams lp,
+	            final Resources res, final int desiredWindowWidth, final int desiredWindowHeight) {
+	        int childWidthMeasureSpec;
+	        int childHeightMeasureSpec;
+	        boolean windowSizeMayChange = false;
+	        ···
+	        boolean goodMeasure = false;
+	        ···
+	        if (!goodMeasure) {
+	            childWidthMeasureSpec = getRootMeasureSpec(desiredWindowWidth, lp.width);
+	            childHeightMeasureSpec = getRootMeasureSpec(desiredWindowHeight, lp.height);
+	            performMeasure(childWidthMeasureSpec, childHeightMeasureSpec);
+	            if (mWidth != host.getMeasuredWidth() || mHeight != host.getMeasuredHeight()) {
+	                windowSizeMayChange = true;
+	            }
+	        }
+	    ···
+	        return windowSizeMayChange;
+	}
+
+上面的代码中调用getRootMeasureSpec()方法来获取根MeasureSpec，这个根MeasureSpec代表了对decorView的宽高的约束信息。所以在一开始传入performMeasure()方法的MeasureSpec的SpecMode为EXACTLY，SpecSize为窗口尺寸。接下来执行的是performMeasure方法。
+
+	private void performMeasure(int childWidthMeasureSpec, int childHeightMeasureSpec) {
+	  . . .
+	  try { 
+	   //调用DecorView的mesure方法。
+	    mView.measure(childWidthMeasureSpec, childHeightMeasureSpec);
+	  } finally {
+	    . . .
+	  }
+	}
+
+接下来会调用到View的meaure方法，在measure()方法中，会决定是否进行重新测量的工作（源码不贴了）如下：
+
+	//final方法，子类不可重写。每个View控件的实际宽高都是由父视图和自身决定的。实际的测量是在onMeasure方法进行，所以在View的子类需要重写onMeasure方法，这是因为measure方法是final的，不允许重载，所以View子类只能通过重载onMeasure来实现自己的测量逻辑。（结合自定义View想想）
+	public final void measure(int widthMeasureSpec, int heightMeasureSpec) {
+        ......
+        //回调onMeasure()方法
+        onMeasure(widthMeasureSpec, heightMeasureSpec);
+        ......
+    }
+
+实际测量工作的是LinearLayout.FrameLayout的onMeasure()方法。DecorView是一个LinearLayout其实。
+
+     //View的onMeasure默认实现方法
+    protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
+        setMeasuredDimension(getDefaultSize(getSuggestedMinimumWidth(), widthMeasureSpec),
+                getDefaultSize(getSuggestedMinimumHeight(), heightMeasureSpec));
+    }
+
+FrameLayout是ViewGroup的子类，后者有一个View[]类型的成员变量mChildren，代表了其子View集合。通过getChildAt(i)能获取指定索引处的子View，通过getChildCount()可以获得子View的总数。
+
+在上面的源码中，首先调用measureChildWithMargins()方法对所有子View进行了一遍测量，并计算出所有子View的最大宽度和最大高度。而后将得到的最大高度和宽度加上padding，这里的padding包括了父View的padding和前景区域的padding。然后会检查是否设置了最小宽高，并与其比较，将两者中较大的设为最终的最大宽高。最后，若设置了前景图像，我们还要检查前景图像的最小宽高。
+
+经过了以上一系列步骤后，我们就得到了maxHeight和maxWidth的最终值，表示当前容器View用这个尺寸就能够正常显示其所有子View（同时考虑了padding和margin）。而后我们需要调用resolveSizeAndState()方法来结合传来的MeasureSpec来获取最终的测量宽高，并保存到mMeasuredWidth与mMeasuredHeight成员变量中。
+
+**从以上代码的执行流程中，我们可以看到，容器View通过measureChildWithMargins()方法对所有子View进行测量后，才能得到自身的测量结果。也就是说，对于ViewGroup及其子类来说，要先完成子View的测量，再进行自身的测量（考虑进padding等）。**   
+接下来我们来看下ViewGroup的measureChildWithMargins()方法的实现：
+
+    protected void measureChildWithMargins(View child,
+            int parentWidthMeasureSpec, int widthUsed,
+            int parentHeightMeasureSpec, int heightUsed) {
+        //获取子视图的LayoutParams
+        final MarginLayoutParams lp = (MarginLayoutParams) child.getLayoutParams();
+        //调整MeasureSpec
+        //通过这两个参数以及子视图本身的LayoutParams来共同决定子视图的测量规格
+        final int childWidthMeasureSpec = getChildMeasureSpec(parentWidthMeasureSpec,
+                mPaddingLeft + mPaddingRight + lp.leftMargin + lp.rightMargin
+                        + widthUsed, lp.width);
+        final int childHeightMeasureSpec = getChildMeasureSpec(parentHeightMeasureSpec,
+                mPaddingTop + mPaddingBottom + lp.topMargin + lp.bottomMargin
+                        + heightUsed, lp.height);
+        //调运子View的measure方法，子View的measure中会回调子View的onMeasure方法
+        child.measure(childWidthMeasureSpec, childHeightMeasureSpec);
+    }
+
+由以上代码我们可以知道，对于ViewGroup来说，它会调用child.measure()来完成子View的测量。传入ViewGroup的MeasureSpec是它的父View用于约束其测量的，那么ViewGroup本身也需要生成一个childMeasureSpec来限制它的子View的测量工作。这个childMeasureSpec就由getChildMeasureSpec()方法生成。接下来我们来分析这个方法：
+
+	public static int getChildMeasureSpec(int spec, int padding, int childDimension) {
+	  // spec为父View的MeasureSpec
+	  // padding为父View在相应方向的已用尺寸加上父View的padding和子View的margin
+	  // childDimension为子View的LayoutParams的值
+	  int specMode = MeasureSpec.getMode(spec);
+	  int specSize = MeasureSpec.getSize(spec);
+	
+	  // 现在size的值为父View相应方向上的可用大小
+	  int size = Math.max(0, specSize - padding);
+	
+	  int resultSize = 0;
+	  int resultMode = 0;
+	
+	  switch (specMode) {
+	    // Parent has imposed an exact size on us
+	    case MeasureSpec.EXACTLY:
+	      if (childDimension >= 0) {
+	        // 表示子View的LayoutParams指定了具体大小值（xx dp）
+	        resultSize = childDimension;
+	        resultMode = MeasureSpec.EXACTLY;
+	      } else if (childDimension == LayoutParams.MATCH_PARENT) {
+	        // 子View想和父View一样大
+	        resultSize = size;
+	        resultMode = MeasureSpec.EXACTLY;
+	      } else if (childDimension == LayoutParams.WRAP_CONTENT) {
+	        // 子View想自己决定其尺寸，但不能比父View大 
+	        resultSize = size;
+	        resultMode = MeasureSpec.AT_MOST;
+	      }
+	      break;
+	
+	    // Parent has imposed a maximum size on us
+	    case MeasureSpec.AT_MOST:
+	      if (childDimension >= 0) {
+	        // 子View指定了具体大小
+	        resultSize = childDimension;
+	        resultMode = MeasureSpec.EXACTLY;
+	      } else if (childDimension == LayoutParams.MATCH_PARENT) {
+	        // 子View想跟父View一样大，但是父View的大小未固定下来
+	        // 所以指定约束子View不能比父View大
+	        resultSize = size;
+	        resultMode = MeasureSpec.AT_MOST;
+	      } else if (childDimension == LayoutParams.WRAP_CONTENT) {
+	        // 子View想要自己决定尺寸，但不能比父View大
+	        resultSize = size;
+	        resultMode = MeasureSpec.AT_MOST;
+	      }
+	      break;
+	
+	      . . .
+	  }
+	
+	  //noinspection ResourceType
+	  return MeasureSpec.makeMeasureSpec(resultSize, resultMode);
+	}
+	
+* MeasureSpec.EXACTLY
+
+	使用measureSpec中size的值作为宽高的精确值
+当我们将控件的layout_width或layout_height指定为具体数值时如andorid:layout_width="50dip"，或者为FILL\_PARENT是，都是控件大小已经确定的情况，都是精确尺寸。
+* MeasureSpec.AT_MOST
+
+	使用measureSpec中size的值作为最大值，采用不超过这个值的最大允许值
+当控件的layout\_width或layout\_height指定为WRAP\_CONTENT时，控件大小一般随着控件的子空间或内容进行变化，此时控件尺寸只要不超过父控件允许的最大尺寸即可。因此，此时的mode是AT_MOST，size给出了父控件允许的最大尺寸。
+* MeasureSpec.UNSPECIFIED
+
+	是未指定尺寸，这种情况不多
+
+从上面的分析我们可以得到一个通用的结论，当子View的测量结果能够确定时，子View的SpecMode就为EXACTLY；当子View的测量结果还不能确定（只是暂时设为某个值）时，子View的SpecMode为AT_MOST。
+
+在measureChildWithMargins()方法中，获取了知道子View测量的MeasureSpec后，接下来就要调用child.measure()方法，并把获取到的childMeasureSpec传入。这时便又会调用onMeasure()方法，若此时的子View为ViewGroup的子类，便会调用相应容器类的onMeasure()方法，其他容器View的onMeasure()方法与FrameLayout的onMeasure()方法执行过程相似。
+
+下面会我们回到FrameLayout的onMeasure()方法，**当递归地执行完所有子View的测量工作后，会调用resolveSizeAndState()方法来根据之前的测量结果确定最终对FrameLayout的测量结果并存储起来。**View类的resolveSizeAndState()方法的源码如下：
+
+	public static int resolveSizeAndState(int size, int measureSpec, int childMeasuredState) {
+	  final int specMode = MeasureSpec.getMode(measureSpec);
+	  final int specSize = MeasureSpec.getSize(measureSpec);
+	  final int result;
+	  switch (specMode) {
+	    case MeasureSpec.AT_MOST:
+	      if (specSize < size) {
+	        // 父View给定的最大尺寸小于完全显示内容所需尺寸
+	        // 则在测量结果上加上MEASURED_STATE_TOO_SMALL
+	        result = specSize | MEASURED_STATE_TOO_SMALL;
+	      } else {
+	       result = size;
+	      }
+	      break;
+	
+	    case MeasureSpec.EXACTLY:
+	      // 若specMode为EXACTLY，则不考虑size，result直接赋值为specSize
+	      result = specSize;
+	      break;
+	
+	    case MeasureSpec.UNSPECIFIED:
+	    default:
+	      result = size;
+	  }
+	
+	  return result | (childMeasuredState & MEASURED_STATE_MASK);
+	
+	}
+
+对于普通View，会调用View类的onMeasure()方法来进行实际的测量工作，该方法的源码如下：
+
+	protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) { 
+		setMeasuredDimension(getDefaultSize(getSuggestedMinimumWidth(), widthMeasureSpec), getDefaultSize(getSuggestedMinimumHeight(), heightMeasureSpec)); 
+	}
+
+对于普通View（非ViewgGroup）来说，只需完成自身的测量工作即可。以上代码中通过setMeasuredDimension()方法设置测量的结果，具体来说是以getDefaultSize()方法的返回值来作为测量结果。getDefaultSize()方法的源码如下：
+
+	public static int getDefaultSize(int size, int measureSpec) {
+	  int result = size;
+	  int specMode = MeasureSpec.getMode(measureSpec);
+	  int specSize = MeasureSpec.getSize(measureSpec);
+	  switch (specMode) {
+	    case MeasureSpec.UNSPECIFIED:
+	      result = size;
+	      break;
+	    case MeasureSpec.AT_MOST:
+	    case MeasureSpec.EXACTLY:
+	      result = specSize;
+	      break;
+	  }
+	  return result;
+	}
+
+**由以上代码我们可以看到，View的getDefaultSize()方法对于AT_MOST和EXACTLY这两种情况都返回了SpecSize作为result。所以若我们的自定义View直接继承了View类，我们就要自己对wrap\_content (对应了AT\_MOST)这种情况进行处理，否则对自定义View指定wrap\_content就和match\_parent效果一样了。**
+
+##### measure原理总结  
+
+通过上面分析可以看出measure过程主要就是从顶层父View向子View递归调用view.measure方法（measure中又回调onMeasure方法）的过程。具体measure核心主要有如下几点：
+
+MeasureSpec（View的内部类）测量规格为int型，值由高2位规格模式specMode和低30位具体尺寸specSize组成。其中specMode只有三种值：
+
+	MeasureSpec.EXACTLY //确定模式，父View希望子View的大小是确定的，由specSize决定；
+	MeasureSpec.AT_MOST //最多模式，父View希望子View的大小最多是specSize指定的值；
+	MeasureSpec.UNSPECIFIED //未指定模式，父View完全依据子View的设计值来决定； 
+
+* View的measure方法是final的，不允许重载，View子类只能重载onMeasure来完成自己的测量逻辑。
+* 最顶层DecorView测量时的MeasureSpec是由ViewRootImpl中getRootMeasureSpec方法确定的（LayoutParams宽高参数均为MATCH\_PARENT，specMode是EXACTLY，specSize为物理屏幕大小）。
+* ViewGroup类提供了measureChild，measureChild和measureChildWithMargins方法，简化了父子View的尺寸计算。
+* 只要是ViewGroup的子类就必须要求LayoutParams继承子MarginLayoutParams，否则无法使用layout_margin参数。
+* View的布局大小由父View和子View共同决定。
+* 使用View的getMeasuredWidth()和getMeasuredHeight()方法来获取View测量的宽高，必须保证这两个方法在onMeasure流程之后被调用才能返回有效值。
+
+#### Layout
+子View具体layout的位置都是相对于父容器而言的，View的layout过程和measure同理，也是从顶级View开始，递归的完成整个空间树的布局操作。
+
+performLayout源码，会执行mView的layout方法：
+
+	//ViewRootImpl
+    private void performLayout(WindowManager.LayoutParams lp, int desiredWindowWidth,int desiredWindowHeight) {
+	
+        final View host = mView;
+        host.layout(0, 0, host.getMeasuredWidth(), host.getMeasuredHeight());
+	
+    }
+
+layout方法：
+
+	//ViewGroup
+
+    //尽管ViewGroup也重写了layout方法
+    //但是本质上还是会通过super.layout()调用View的layout()方法
+    @Override
+    public final void layout(int l, int t, int r, int b) {
+        if (!mSuppressLayout && (mTransition == null || !mTransition.isChangingLayout())) {
+
+            //如果无动画，或者动画未运行
+            super.layout(l, t, r, b);
+        } else {
+            //等待动画完成时再调用requestLayout()
+            mLayoutCalledWhileSuppressed = true;
+        }
+    }
+
+	//View
+
+    public void layout(int l, int t, int r, int b) {
+        int oldL = mLeft;
+        int oldT = mTop;
+        int oldB = mBottom;
+        int oldR = mRight;
+
+        //如果布局有变化，通过setFrame重新布局
+        boolean changed = isLayoutModeOptical(mParent) ?
+                setOpticalFrame(l, t, r, b) : setFrame(l, t, r, b);
+
+        if (changed || (mPrivateFlags & PFLAG_LAYOUT_REQUIRED) == PFLAG_LAYOUT_REQUIRED) {
+
+            //如果这是一个ViewGroup，还会遍历子View的layout()方法
+            //如果是普通View，通知具体实现类布局变更通知
+            onLayout(changed, l, t, r, b);
+
+            //清除PFLAG_LAYOUT_REQUIRED标记
+            mPrivateFlags &= ~PFLAG_LAYOUT_REQUIRED;
+            ``````
+            //布局监听通知
+        }
+
+        //清除PFLAG_FORCE_LAYOUT标记
+        mPrivateFlags &= ~PFLAG_FORCE_LAYOUT;
+    }
+
+ViewGroup的onLayout()方法竟然是一个抽象方法，这就是说所有ViewGroup的子类都必须重写这个方法。所以在自定义ViewGroup控件中，onLayout配合onMeasure方法一起使用可以实现自定义View的复杂布局。自定义View首先调用onMeasure进行测量，然后调用onLayout方法动态获取子View和子View的测量大小，然后进行layout布局。重载onLayout的目的就是安排其children在父View的具体位置，重载onLayout通常做法就是写一个for循环调用每一个子视图的layout(l, t, r, b)函数，传入不同的参数l, t, r, b来确定每个子视图在父视图中的显示位置。
+
+layout阶段的大致流程我们就分析完了，这个阶段主要就是根据上一阶段得到的View的测量宽高来确定View的最终显示位置。显然，经过了measure阶段和layout阶段，我们已经确定好了View的大小和位置，那么接下来就可以开始绘制View了。
+
+##### layout原理总结
+整个layout过程比较容易理解，从上面分析可以看出layout也是从顶层父View向子View的递归调用view.layout方法的过程，即父View根据上一步measure子View所得到的布局大小和布局参数，将子View放在合适的位置上。具体layout核心主要有以下几点：
+
+* View.layout方法可被重载，ViewGroup.layout为final的不可重载，ViewGroup.onLayout为abstract的，子类必须重载实现自己的位置逻辑。（结合自定义viewgrounp）
+* measure操作完成后得到的是对每个View经测量过的measuredWidth和measuredHeight，layout操作完成之后得到的是对每个View进行位置分配后的mLeft、mTop、mRight、mBottom，这些值都是相对于父View来说的。
+* **使用View的getWidth()和getHeight()方法来获取View测量的宽高，必须保证这两个方法在onLayout流程之后被调用才能返回有效值。**
+
+#### Draw
+draw过程也是在ViewRootImpl的performTraversals()内部调运的，其调用顺序在measure()和layout()之后，这里的mView对于Actiity来说就是PhoneWindow.DecorView，ViewRootImpl中的代码会创建一个Canvas对象，然后调用View的draw()方法来执行具体的绘制工。所以又回归到了ViewGroup与View的树状递归draw过程。
+
+View.draw()方法源码：
+
+	public void draw(Canvas canvas) {
+	  . . . 
+	  // 绘制背景，只有dirtyOpaque为false时才进行绘制，下同
+	  int saveCount;
+	  if (!dirtyOpaque) {
+	    drawBackground(canvas);
+	  }
+	  . . . 
+	  // 绘制自身内容
+	  if (!dirtyOpaque) onDraw(canvas);
+	  // 绘制子View
+	  dispatchDraw(canvas);
+	   . . .
+	  // 绘制滚动条等
+	  onDrawForeground(canvas);
+	
+	}
+
+##### 第一步，对View的背景进行绘制。 
+可以看见，draw方法通过调运drawBackground(canvas);方法实现了背景绘制。我们来看下这个方法源码，如下：
+
+      private void drawBackground(Canvas canvas) {
+        //获取xml中通过android:background属性或者代码中setBackgroundColor()、setBackgroundResource()等方法进行赋值的背景Drawable
+        final Drawable background = mBackground;
+        ......
+        //根据layout过程确定的View位置来设置背景的绘制区域
+        if (mBackgroundSizeChanged) {
+            background.setBounds(0, 0,  mRight - mLeft, mBottom - mTop);
+            mBackgroundSizeChanged = false;
+            rebuildOutline();
+        }
+        ......
+            //调用Drawable的draw()方法来完成背景的绘制工作
+            background.draw(canvas);
+        ......
+    }
+
+##### 第二步，对View的内容进行绘制。
+
+可以看到，这里去调用了一下View的onDraw()方法，所以我们看下View的onDraw方法（ViewGroup也没有重写该方法），如下：
+
+    /**
+     * Implement this to do your drawing.
+     *
+     * @param canvas the canvas on which the background will be drawn
+     */
+    protected void onDraw(Canvas canvas) {
+    }
+
+这是一个空方法。因为每个View的内容部分是各不相同的，所以需要由子类去实现具体逻辑。
+
+##### 第三步，对当前View的所有子View进行绘制，如果当前的View没有子View就不需要进行绘制。 
+我们来看下View的draw方法中的dispatchDraw(canvas);方法源码，可以看见如下：
+
+    protected void dispatchDraw(Canvas canvas) {}
+
+View的dispatchDraw()方法是一个空方法，而且注释说明了如果View包含子类需要重写他，所以我们有必要看下ViewGroup的dispatchDraw方法源码（这也就是刚刚说的对当前View的所有子View进行绘制，如果当前的View没有子View就不需要进行绘制的原因，因为如果是View调运该方法是空的，而ViewGroup才有实现），如下：
+
+        @Override
+    protected void dispatchDraw(Canvas canvas) {
+        ......
+        final int childrenCount = mChildrenCount;
+        final View[] children = mChildren;
+        ......
+        for (int i = 0; i < childrenCount; i++) {
+            ......
+            if ((child.mViewFlags & VISIBILITY_MASK) == VISIBLE || child.getAnimation() != null) {
+                more |= drawChild(canvas, child, drawingTime);
+            }
+        }
+        ......
+        // Draw any disappearing views that have animations
+        if (mDisappearingChildren != null) {
+            ......
+            for (int i = disappearingCount; i >= 0; i--) {
+                ......
+                more |= drawChild(canvas, child, drawingTime);
+            }
+        }
+        ......
+    }
+
+可以看见，ViewGroup确实重写了View的dispatchDraw()方法，该方法内部会遍历每个子View，然后调用drawChild()方法，我们可以看下ViewGroup的drawChild方法，如下：
+
+	protected boolean drawChild(Canvas canvas, View child, long drawingTime) {
+	    return child.draw(canvas, this, drawingTime);
+	}
+
+**可以看见drawChild()方法调运了子View的draw()方法。所以说ViewGroup类已经为我们重写了dispatchDraw()的功能实现，我们一般不需要重写该方法，但可以重载父类函数实现具体的功能。**
+
+##### 第四步，对View的滚动条进行绘制。
+
+可以看到，这里去调用了一下View的onDrawScrollBars()方法，所以我们看下View的onDrawScrollBars(canvas);方法，如下：
+
+    protected final void onDrawScrollBars(Canvas canvas) {
+        //绘制ScrollBars分析不是我们这篇的重点，所以暂时不做分析
+        ......
+    }
+
+可以看见其实任何一个View都是有（水平垂直）滚动条的，只是一般情况下没让它显示而已。 
+到此，View的draw绘制部分源码分析完毕，我们接下来进行一些总结。
+
+##### draw原理总结
+可以看见，绘制过程就是把View对象绘制到屏幕上，整个draw过程需要注意如下细节：
+
+* 如果该View是一个ViewGroup，则需要递归绘制其所包含的所有子View。
+* View默认不会绘制任何内容，真正的绘制都需要自己在子类中实现。
+* View的绘制是借助onDraw方法传入的Canvas类来进行的。
+* 区分View动画和ViewGroup布局动画，前者指的是View自身的动画，可以通过setAnimation添加，后者是专门针对ViewGroup显示内部子视图时设置的动画，可以在xml布局文件中对ViewGroup设置layoutAnimation属性（譬如对LinearLayout设置子View在显示时出现逐行、随机、下等显示等不同动画效果）。
+* 在获取画布剪切区（每个View的draw中传入的Canvas）时会自动处理掉padding，子View获取Canvas不用关注这些逻辑，只用关心如何绘制即可。
+* 默认情况下子View的ViewGroup.drawChild绘制顺序和子View被添加的顺序一致，但是你也可以重载ViewGroup.getChildDrawingOrder()方法提供不同顺序。
+
+#### invalidate and postInvalidate
+我们知道invalidate()(在主线程)和postInvalidate()(可以在子线程)都是用于请求View重绘的方法，那么它是如何实现的呢？
+
+这个ViewRootImpl类的invalidateChildInParent方法直接返回了null，也就是上面ViewGroup中说的，层层上级传递到ViewRootImpl的invalidateChildInParent方法结束了那个do while循环。看见这里调运的scheduleTraversals这个方法吗？scheduleTraversals会通过Handler的Runnable发送一个异步消息，调运doTraversal方法，然后最终调用performTraversals()执行重绘。开头背景知识介绍说过的，performTraversals就是整个View数开始绘制的起始调运地方。
+
+**所以说View调运invalidate方法的实质是层层上传到父级，直到传递到ViewRootImpl后触发了scheduleTraversals方法，然后整个View树开始重新按照上面分析的View绘制流程进行重绘任务。**
+
+postInvalidate方法
+
+上面分析invalidate方法时注释中说该方法只能在UI Thread中执行，其他线程中需要使用postInvalidate方法，所以我们来分析分析postInvalidate这个方法源码。如下：
+
+  	public void postInvalidate() {
+        postInvalidateDelayed(0);
+    }
+
+	public void dispatchInvalidateDelayed(View view, long delayMilliseconds) {
+        Message msg = mHandler.obtainMessage(MSG_INVALIDATE, view);
+        mHandler.sendMessageDelayed(msg, delayMilliseconds);
+    }
+
+**通过ViewRootImpl类的Handler发送了一条MSG_INVALIDATE消息，handleMessage运行在主线程中，所以实质就是又在UI Thread中调运了View的invalidate()**
+
+#### View的requestLayout方法源码分析
+和invalidate类似，其实在上面分析View绘制流程时或多或少都调运到了这个方法，而且这个方法对于View来说也比较重要，所以我们接下来分析一下他。如下View的requestLayout源码：
+
+  	public void requestLayout() {
+        ......
+        if (mParent != null && !mParent.isLayoutRequested()) {
+            //由此向ViewParent请求布局
+            //从这个View开始向上一直requestLayout，最终到达ViewRootImpl的requestLayout
+            mParent.requestLayout();
+        }
+        ......
+    }
+
+当我们触发View的requestLayout时其实质就是层层向上传递，直到ViewRootImpl为止，然后触发ViewRootImpl的requestLayout方法，如下就是ViewRootImpl的requestLayout方法：
+
+ 	@Override
+    public void requestLayout() {
+        if (!mHandlingLayoutInLayoutRequest) {
+            checkThread();
+            mLayoutRequested = true;
+            //View调运requestLayout最终层层上传到ViewRootImpl后最终触发了该方法
+            scheduleTraversals();
+        }
+    }
+
+**requestLayout()方法会改变mLayoutRequested 的值，在重绘过程中只调用measure过程和layout过程，不会调用draw过程，也不会重新绘制任何View包括该调用者本身。  
+而invalidate只会出发draw。**
+
+### ViewRoot和DecorView
+---
+[window、Activity、DecorView、ViewRoot关系](https://www.jianshu.com/p/049df709ddbf)
+
+Activity并不负责视图控制，它只是控制生命周期和处理事件，真正控制视图的是Window。一个Activity包含了一个Window，Window才是真正代表一个窗口，Window 中持有一个 DecorView，而这个DecorView才是 view 的根布局。
+
+#### DecorView
+DecorView是FrameLayout的子类，它可以被认为是Android视图树的根节点视图。DecorView作为顶级View，一般情况下它内部包含一个竖直方向的LinearLayout，在这个LinearLayout里面有上下两个部分（具体情况和Android版本及主体有关），上面的是标题栏，下面的是内容栏。在Activity中通过setContentView所设置的布局文件其实就是被加到内容栏之中的，而内容栏的id是content，在代码中可以通过ViewGroup content = （ViewGroup)findViewById(R.android.id.content)来得到content对应的layout。
+
+**DecorView是顶级View，内部有titlebar和contentParent两个子元素，contentParent的id是content，而我们设置的main.xml布局则是contentParent里面的一个子元素。**
+
+#### ViewRoot
+ViewRoot对应ViewRootImpl类，它是连接WindowManagerService和DecorView的纽带，View的三大流程(测量（measure），布局（layout），绘制（draw）)均通过ViewRoot来完成。ViewRoot并不属于View树的一份子。从源码实现上来看，它既非View的子类，也非View的父类，但是，它实现了ViewParent接口，这让它可以作为View的名义上的父视图。RootView继承了Handler类，可以接收事件并分发，Android的所有触屏事件、按键事件、界面刷新等事件都是通过ViewRoot进行分发的。ViewRoot可以被理解为“View树的管理者”——它有一个mView成员变量，它指向的对象和上文中Window和Activity的mDecor指向的对象是同一个对象。
+
+Android系统中，ViewRoot对应于ViewRootImpl类，它是连接WindowManager和DecorView的纽带，View的三大流程（measure、layout、draw）都是通过ViewRoot来完成的。 
+在Activity对象被创建完毕后，会将DecorView添加到Window中。同时，会创建ViewRootImpl对象，并将ViewRootImpl对象和DecorView建立关联。
+
+	ViewRootImpl  root = new ViewRootImpl(view.getContext,display);
+	root.setView(view,params,panelParentView);
+
+View的绘制流程是从ViewRoot的performTraversals方法开始的，它经过measure、layout、draw三个流程，最终才可以将这个view绘制出来。
+
+measure： 负责测量view的宽度 和 高度；  
+layout： 负责确定view在父容器中的位置；  
+draw： 负责将view绘制在屏幕上。
+
+performTraversals的大致流程如图所示。 
+ViewRoot和DectorView
+
+如图所示，performTraversals时会依次调用performMeasure、performLayout和performDraw。这三个方法会完成View的measure、layout和draw三个流程。  
+performMeasure会内在调用measure方法，measure方法实质上又会调用onMeasure方法，在onMeasure方法方法里面对所有的子元素进行测量操作。之后measure的流程就会从父容器传递到子元素中了，这样 就完成了一次measure操作。子元素也会重复父容器中的measure操作，如是反复就完成了View树的遍历。同理，performLayout和performDraw的实现原理也是这样的。
+
+1. measure过程决定了View的测量后的宽度/高度，measure过程完成之后，就可以通过getMeasuredWidth和getMeasuredHeight方法来获取View的测量宽度/高度； 
+2. layout过程决定了View的四个顶点的位置和实际的View的宽度和高度。完成之后，可以通过getTop/getBottom/getLeft/getRight获取四个顶点的位置，并且可以通过getWidth/getHeight获取View的最终高度/宽度。 
+3. draw过程则决定了View的显示，只有draw方法完成后我们才可以在屏幕上看到View。
+
+### 自定义view
+---
 测量onMeasure  
 布局onLayout  
 绘制onDraw
-### 多线程，同步锁，wait&sleep
+
 ### Android多线程
 ---
 Android提供了四种常用的操作多线程的方式，分别是：
@@ -1439,6 +2235,11 @@ Proxy是Stub的内部类，也实现了IMyAidlInterface接口。并提供了几�
 ### 网络TCP/IP, HTTP
 ### sqlite数据库知识
 ### ContentProvider相关知识
+---
+ContentProvider是通过IBinder实现通信过程的  
+getContentResolver获得到的是ApplicationContentResolver（在ContextImpt中实现的）  
+Client端ApplicationContentResolver使用ContentProviderProxy作为IBinder的Proxy（ContentProviderNative中实现）  
+Provider端通过Transport作为IBinder的实现端（ContentProvider中实现）
 
 #### 多个进程同时调用一个ContentProvider的query获取数据，ContentPrvoider是如何反应的呢？
 一个content provider可以接受来自另外一个进程的数据请求。尽管ContentResolver与ContentProvider类隐藏了实现细节，但是ContentProvider所提供的query()，insert()，delete()，update()都是在ContentProvider进程的线程池中被调用执行的，而不是进程的主线程中。这个线程池是有Binder创建和维护的，其实使用的就是每个应用进程中的Binder线程池。
@@ -1447,6 +2248,148 @@ Proxy是Stub的内部类，也实现了IMyAidlInterface接口。并提供了几�
 ContentProvider是管理者，内容提供者。提供的内容来自文件，数据库等  
 ContentObserver是观察者，通过特定URI来感知内容的变化  
 ContentResolver是操作者，通过特定URI来对数据进行增删改查
+
+### apk瘦身优化
+---
+
+1. 使用一套资源就好  
+这是最基本的一条规则，但非常重要。  
+对于绝大对数APP来说，只需要取一套设计图就足够了。  
+鉴于现在分辨率的趋势，建议取720p的资源，放到xhdpi目录。
+
+2. 移除无用资源  
+minifyEnabled true  
+shrinkResources true// 压缩，清除无用资源。需要配合上面混淆使用  
+zipAlignEnabled true
+
+3. 删除R.class文件，使用常量替换  
+android中的R文件，除了styleable类型外，所有字段都是int型变量/常量，且在运行期间都不会改变。所以可以在编译时，记录R中所有字段名称及对应值，然后利用asm工具遍历所有class，将引用R字段的地方替换成对应常量。  
+https://github.com/meili/ThinRPlugin/blob/master/README.zh-cn.md
+
+4. 移除未使用的国际化资源包  
+只包含使用到的语言即可  
+
+		defaultConfig {  
+		         resConfigs "zh", "zh_CN", "zh_HK", "zh_MO", "zh_TW", "en"
+		}
+  
+4. 资源名称混淆  
+微信资源混淆方案  
+https://github.com/shwenzhang/AndResGuard
+
+5. libs下so库的优化  
+降低so库的体积  
+只提供对主流架构的支持，比如arm，对于mips和x86架构可以考虑不提供支持，系统会自动提供相应的兼容。爱奇艺客户端只在armeabi下面放置了一套so库文件。  
+删除armable-v7包下的so，基本上armable的so也是兼容armable-v7的，armable-v7a的库会对图形渲染方面有很大的改进，如果没有这方面的要求，可以精简。  
+
+6. 使用新的签名工具apksigner  
+Google在Android7.0系统提供了新的apksigner签名工具，相比使用java提供的jarsigner签名工具，APK体积可以减小约5%（依赖文件数量）。
+
+7. 用注解替代枚举  
+枚举最大的作用是提供了类型安全。为了弥补Android平台不建议使用枚举的缺陷，官方推出了两个注解，IntDef和StringDef,用来提供编译期的类型检查。
+
+8. 减少使用切图，背景大图。  
+尽量使用shape，和纯色背景图
+
+9. 图片压缩  
+https://www.tinypng.com/  
+https://pngquant.org/  
+https://developers.google.com/speed/docs/insights/OptimizeImages  
+市面上有许多工具可用来对JPEG和PNG文件执行进一步的无损压缩，且不会对图片质量造成任何影响。对于JPEG文件，我们建议您使用jpegtran或jpegoptim（仅适用于Linux；使用--strip-all选项运行）。对于PNG文件，我们建议使用OptiPNG或PNGOUT。
+
+10. 采用压缩率更高的webp图片格式，代替当前的png格式
+
+11. 删除一些用户量极少，“无意义”的功能  
+
+12. 检查第三方包，把不需要的组件、图片之类的删除或替换
+
+13. 把部分页面做成H5，客户端删除这部分功能
+
+### Android组件化&插件化
+---
+* 组件化开发就是将一个app分成多个模块，每个模块都是一个组件（Module），开发的过程中我们可以让这些组件相互依赖或者单独调试部分组件等，但是最终发布的时候是将这些组件合并统一成一个apk，这就是组件化开发。
+* 插件化开发和组件化开发略有不用，插件化开发时将整个app拆分成很多模块，这些模块包括一个宿主和多个插件，每个模块都是一个apk（组件化的每个模块是个lib），最终打包的时候将宿主apk和插件apk分开或者联合打包。
+
+**组件化是在编译期分模块，插件化是在运行期。**
+
+### Android组件化开发
+---
+模块化开发的升级
+
+[Android 组件化开发详解](https://www.jianshu.com/p/b7d4e6612e0c)  
+[终极组件化框架项目方案详解——讲的很好](https://www.jianshu.com/p/e6eb9c8d120f)
+
+正常一个App中可以有多个module，但是一般只会有一个module是设置为application的，其他均设置为library，组件化开发就是要每个module都可以运行起来，因此在开发期间每个module均设置为application，发布时再进行合并。
+
+组件化架构图
+
+![](https://upload-images.jianshu.io/upload_images/4290785-369cb20535596b56.png?imageMogr2/auto-orient/strip%7CimageView2/2/w/565)
+
+因为组件与组件之间不能相互引用，所以组件与组件的交互需要一个中间件Router,组件进行交互之前需要通过Router进行寻址中转传递彼此的接口。
+
+#### 为什么需要组件化和组件化带来的好处？
+1. 现在Android项目中代码量达到一定程度，编译将是一件非常痛苦的事情，一般都需要变异5到6分钟。Android studio推出instant run由于各种缺陷和限制条件（比如采用热修复tinker）一般情况下是被关闭的。而组件化框架可以使模块单独编译调试，可以有效地减少编译的时间。
+2. 通过组件化可以更好的进行并行开发，因为我们可以为每一个模块进行单独的版本控制，甚至每一个模块的负责人可以选择自己的设计架构而不影响其他模块的开发，与此同时组件化还可以避免模块之间的交叉依赖，每一个模块的开发人员可以对自己的模块进行独立测试，独立编译和运行，甚至可以实现单独的部署。从而极大的提高了并行开发效率。
+
+#### 组件化的优点和缺点
+优点：
+
+1. 单独编译，便于开发，提升编译速度。
+2. 组件分离，便于维护，提高重用效率。
+3. 单独发布，便于测试，提升测试准度。
+
+缺点：
+
+对开发管理的要求更高
+
+## 题目
+1. 一个apk从开始安装启动,系统都做了哪些事情?请从AMS,WMS,PMS的角度考虑下,以及进程是如何启动的?
+
+	[概述安卓App的安装和启动](https://www.jianshu.com/p/fa31d64ca57b)
+	
+2. AMS与WMS相关的数据结构和沟通的桥梁是什么?AMS的堆栈是如何管理的?WMS的堆栈是如何管理的?
+3. Android内存管理机制以及LMK相关的机制,以及AMS中进程管理机制,请分别介绍下
+4. PMS相关的开机流程,apk安装的流程, adb install和 pms scan的区别有哪
+5. Broadcast的机制,分发的流程是什么?如何传递到每个app进程的?动态广播和静态广播的处理流程在哪里不一样?
+6. 多用户最主要的机制以及创建一个新的用户系统需要做哪些事情
+7. Runtime permission,如何把一个预置的app默认给它权限,不要授权。
+8. 如何实现预装的apk在卸载后,通过恢复出厂设置恢复过来,请介绍下方案
+9. Android资源加载和打包的机制介绍,一个图片在app中调用R.id 调用后是如何找到的?
+10. Android Overlay的机制是什么?
+
+	Android Overlay是一种资源替换机制，它能在不重新打包apk的情况下，实现资源文件的替换（res目录非assert目录），Overlay又分为静态Overlay(Static Resource Overlay)与运行时Overlay(Runtime Resource Overlay)。
+	
+	SRO–Static resource overlay(静态替换)  
+SRO是在编译时完成的，我们可以根据不同的产品，为app/framework加载不同的资源。编译时资源就已经覆盖了，一般用在有源码的apk中。
+
+	RRO-Runtime Resource Overlay  
+	运行时 overlay，当 apk 在手机中运行时才发生资源覆盖，一般用在无源码的apk中。
+
+11. Android权限管理的机制是什么？
+
+	权限是Android中一个非常重要的组成部分，许多操作都需要获取到权限才能进行。在Android6.0之后，权限机制发生了重大变化，加入了运行时权限这一概念。
+	
+	Android大致将权限分为两类，即普通权限和危险权限。对于普通权限，依旧使用Android6.0之前的权限机制，只需要在AndroidManifest中声明即可。而对于危险权限，则必须在应用运行时主动申请，由用户决定是否授予。
+	
+12. 为何 android.uid.system相关的进程不能访问 sdcard
+13. 开机流程和关机流程请描述下
+14. Bootanimation是如何启动和退出的
+15. Binder相关的机制以及在 Android平台的使用, Android还有什么IPC通信方式,各有什么优缺点?
+16. 死机,重启等 stability问题分析流程? watchdog reset如何分析
+17. Native Crash问题如何分析,以及 crash在art相关的oat,odex文件如何分析
+18. Android ART机制,与 dalvik的区别,JIT与AOT的区别是什么? ART GC有什么改善,还有什么缺点?
+19. ANR, OOM等问题的分析流程介绍
+20. Android++智能指针相关的使用介绍
+21. Android编译,优化,ART相关编译优化
+22. input相关事件的分发机制,tp相关问题解决
+23. 按键事件和tp事件的处理有什么不同点和相同点吗?
+24. 功耗相关问题的分析
+25. 性能相关问题的分析
+26. Android N与M的一些典型的改变有哪些? Multi-window机制介绍
+27. PowerManagerService主要做了哪些相关的操作?系统亮灭屏都有哪些流程?
+28. Wakelock机制, android如何和linux管理这些 wakelock
+29. Alarm相关机制，doze相关的机制及运行方式
+
 
 ## Java 
 ### Java类加载
@@ -1476,23 +2419,85 @@ ContentResolver是操作者，通过特定URI来对数据进行增删改查
 
 	程序可以通过判断引用队列中是否已经加入了虚引用，来了解被引用的对象是否将要被垃圾回收。如果程序发现某个虚引用已经被加入到引用队列，那么就可以在所引用的对象的内存被回收之前采取必要的行动。
 
-### Leecode算法题
-### 集合基础知识
-### Java内存模型
+### Java中的volatile 变量是什么？
+1. volatile声明的变量，将由本地内存强制刷新到主内存
+2. 写操作会导致其他线程中的缓存失效
 
-Java内存模型即Java Memory Model，简称**JMM**。JMM定义了Java 虚拟机(JVM)在计算机内存(RAM)中的工作方式。程序中的变量存储在主内存中，每个线程拥有自己的工作内存并存放变量的拷贝，线程读写自己的工作内存，通过主内存进行变量的交互。JMM就是规定了工作内存和主内存之间变量访问的细节，通过保障原子性、有序性、可见性来实现线程的有效协同和数据的安全。  
+可用于单例模式的加强
+
+volatile是一个特殊的修饰符，只有成员变量才能使用它。在Java并发程序缺少同步类的情况下，多线程对成员变量的操作对其它线程是透明的。volatile变量可以保证下一个读取操作会在前一个写操作之后发生，就是上一题的volatile变量规则。
+
+### 多线程，同步锁，wait&sleep&join
+* wait是Object的一个函数   
+wait()方法是Object类里的方法；当一个线程执行到wait()方法时，它就进入到一个和该对象相关的等待池中，同时失去（释放）了对象的机锁（暂时失去机锁，wait(long timeout)超时时间到后还需要返还对象锁）；其他线程可以访问；  
+wait()使用notify或者notifyAlll或者指定睡眠时间来唤醒当前等待池中的线程。  
+wait()必须放在synchronized block中，否则会在program runtime时扔出”java.lang.IllegalMonitorStateException“异常。
+
+* sleep则是Thread的一个函数  
+sleep()是Thread类的Static(静态)的方法；因此他不能改变对象的机锁，所以当在一个Synchronized块中调用Sleep()方法是，线程虽然休眠了，但是对象的机锁并木有被释放，其他线程无法访问这个对象（即使睡着也持有对象锁）。  
+在sleep()休眠时间期满后，该线程不一定会立即执行，这是因为其它线程可能正在运行而且没有被调度为放弃执行，除非此线程具有更高的优先级。线程调度需要时间。
+
+	多线程下的区别：
+	1. sleep可以在任何地方使用，而wait只能在同步方法或者同步块中使用。
+	2. sleep,wait调用后都会暂停当前线程并让出cpu的执行时间，但不同的是sleep不会释放当前持有的对象的锁资源，到时间后会继续执行，而wait会放弃所有锁并需要notify/notifyAll后重新获取到对象锁资源后才能继续执行。
+	3. sleep需要捕获或者抛出异常，而wait/notify/notifyAll不需要。
+	4. sleep()方法没有释放锁，而wait方法释放了锁，使得其他线程可以使用使用同步控制块或方法。
+	5. wait()和sleep()都可以通过interrupt()方法打断线程的暂停状态，从而使线程立刻抛出InterruptedException（但不建议使用该方法）。
+
+* join也是Thread的一个函数  
+join的作用就相当于阻塞掉除了当前线程以外的所有的线程（包括主线程），等待自己执行结束，并且遵守先来后到的排队原则，先join的先执行，后join后执行，必须注意的是，最后的线程不能使用join，否则线程就全部在等待中，可以把最后一条不使用join的线程，当做此次排队的结束。
+
+### 集合基础知识
+ConcurrentHashMap
+
+### Java内存模型
+---
+Java内存模型即Java Memory Model，简称**JMM**。JMM定义了Java 虚拟机(JVM)在计算机内存(RAM)中的工作方式。程序中的变量存储在主内存中，每个线程拥有自己的工作内存并存放变量的拷贝，线程读写自己的工作内存，通过主内存进行变量的交互。JMM就是规定了工作内存和主内存之间变量访问的细节，通过保障**原子性、有序性、可见性**来实现线程的有效协同和数据的安全。  
 	
 **JVM如何判断一个对象实例是否应该被回收？**  
 垃圾回收器会建立有向图的方式进行内存管理，通过GC Roots来往下遍历，当发现有对象处于不可达状态的时候，就会对其标记为不可达，以便于后续的GC回收。  
 	
 **JVM的垃圾回收策略**  
 JVM采用分代垃圾回收。在JVM的内存空间中把堆空间分为年老代和年轻代。将大量创建了没多久就会消亡的对象存储在年轻代，而年老代中存放生命周期长久的实例对象。  
+
+### JVM内存结构 & Java内存模型 & Java对象模型
+---
+#### Java内存结构
+JVM运行时内存区域结构如下  
+![](https://mmbiz.qpic.cn/mmbiz_png/6fuT3emWI5IUn7IK1IHXbPncn0qUVqFDPOXDhD9dqSdaMa09ibl7QBFXBZgQ0C7vvb0UUAO3zqszZlNVcPBrMgg/640?wxfrom=5&wx_lazy=1)
+
+Java代码是要运行在虚拟机上的，而虚拟机在执行Java程序的过程中会把所管理的内存划分为若干个不同的数据区域，这些区域都有各自的用途。
+其中有些区域随着虚拟机进程的启动而存在，而有些区域则依赖用户线程的启动和结束而建立和销毁。
+
+**做个总结，JVM内存结构，由Java虚拟机规范定义。描述的是Java程序执行过程中，由JVM管理的不同数据区域。各个区域有其特定的功能。**
+
+#### Java内存模型
+关于JVM的内存结构的图中，我们可以看到，其中Java堆和方法区的区域是多个线程共享的数据区域。也就是说，多个线程可能可以操作保存在堆或者方法区中的同一个数据。这也就是我们常说的“Java的线程间通过共享内存进行通信”。
+
+简单总结下，Java的多线程之间是通过共享内存进行通信的，而由于采用共享内存进行通信，在通信过程中会存在一系列如可见性、原子性、顺序性等问题，而JMM就是围绕着多线程通信以及与其相关的一系列特性而建立的模型。JMM定义了一些语法集，这些语法集映射到Java语言中就是volatile、synchronized等关键字。
+
+**在JMM中，我们把多个线程间通信的共享内存称之为主内存，而在并发编程中多个线程都维护了一个自己的本地内存（这是个抽象概念），其中保存的数据是主内存中的数据拷贝。而JMM主要是控制本地内存和主内存之间的数据交互的。**
+
+![](https://mmbiz.qpic.cn/mmbiz_png/6fuT3emWI5IUn7IK1IHXbPncn0qUVqFDISlBmo2qybFM7JhbWt1SKicU3Tqd1myTXKy91aUicjawZRyOYunLB17w/640?wxfrom=5&wx_lazy=1)
+
+在Java中，JMM是一个非常重要的概念，正是由于有了JMM，Java的并发编程才能避免很多问题。
+
+#### Java对象模型
+Java是一种面向对象的语言，而Java对象在JVM中的存储也是有一定的结构的。而这个关于Java对象自身的存储模型称之为Java对象模型。
+
+每一个Java类，在被JVM加载的时候，JVM会给这个类创建一个instanceKlass，保存在方法区，用来在JVM层表示该Java类。当我们在Java代码中，使用new创建一个对象的时候，JVM会创建一个instanceOopDesc对象，这个对象中包含了对象头以及实例数据。
+
+#### 总结
+* JVM内存结构，和Java虚拟机的运行时区域有关。
+* Java内存模型，和Java的并发编程有关。
+* Java对象模型，和Java对象在虚拟机中的表现形式有关。
 	
 ### 常用的设计模式
 
+### Leecode算法题
 
-# 数据库
----
+
+## 数据库
 ### 基本操作
 1. INSERT INTO table_name (列) VALUES(值)
 2. INSERT INTO table_name VALUES(值)
